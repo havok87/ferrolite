@@ -1,0 +1,70 @@
+# ferrolite example config. The format is LiteLLM's config.yaml.
+#
+# Secrets can be written as references instead of literals:
+#   os.environ/VAR                 an environment variable
+#   file/<path>                    a file only its owner can read (chmod 600);
+#                                  relative paths resolve against this file's directory
+#   keychain/<service>/<account>   a macOS keychain generic password, e.g. stored with
+#                                  security add-generic-password -s ferrolite -a anthropic -w
+#
+# References work in general_settings.master_key and, per deployment, in
+# api_key, api_base and extra_headers values.
+
+model_list:
+  # OpenAI itself.
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+      rpm: 500
+
+  # Every OpenAI model by name, e.g. a request for "openai/gpt-4.1-mini".
+  - model_name: openai/*
+    litellm_params:
+      model: openai/*
+      api_key: os.environ/OPENAI_API_KEY
+
+  # Anthropic through its native Messages API.
+  - model_name: claude-sonnet
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      # api_key: keychain/ferrolite/anthropic
+      max_tokens: 4096          # extra keys become request defaults
+    model_info:
+      max_input_tokens: 200000
+
+  # A local Ollama. ferrolite talks to Ollama's OpenAI-compatible /v1 API;
+  # "/v1" is appended to api_base when it is missing.
+  - model_name: local
+    litellm_params:
+      model: ollama_chat/qwen3:8b
+      api_base: http://127.0.0.1:11434
+
+  # A vLLM server on the local network, sharing the "local" group with Ollama.
+  - model_name: local
+    litellm_params:
+      model: hosted_vllm/Qwen/Qwen3-8B
+      api_base: http://192.168.1.50:8000/v1
+      weight: 2
+
+router_settings:
+  routing_strategy: simple-shuffle
+  num_retries: 2
+  allowed_fails: 3
+  cooldown_time: 30
+  model_group_alias:
+    smart: claude-sonnet
+  fallbacks:
+    - gpt-4o: [claude-sonnet]
+  context_window_fallbacks:
+    - gpt-4o: [claude-sonnet]
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 600
+
+general_settings:
+  # At least 32 characters, starting with "sk-". Generate one with:
+  #   printf 'sk-%s\n' "$(openssl rand -hex 24)"
+  master_key: os.environ/FERROLITE_MASTER_KEY

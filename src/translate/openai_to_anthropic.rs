@@ -51,9 +51,12 @@ pub fn request(
     model_info: &ModelInfo,
     drop_params: bool,
 ) -> Result<Value, TranslateError> {
-    let mut body = body.clone();
-    check_params(&mut body, supported, drop_params, "anthropic")?;
-    let get = |k: &str| body.get(k).filter(|v| !v.is_null());
+    let dropped = check_params(body, supported, drop_params, "anthropic")?;
+    let get = |k: &str| {
+        body.get(k)
+            .filter(|v| !v.is_null())
+            .filter(|_| !dropped.contains(&k))
+    };
 
     let messages = get("messages")
         .and_then(Value::as_array)
@@ -493,6 +496,7 @@ pub struct StreamTranslator {
     usage: AnthropicUsage,
     finish: Option<&'static str>,
     done: bool,
+    failed: bool,
 }
 
 impl StreamTranslator {
@@ -509,7 +513,13 @@ impl StreamTranslator {
             usage: AnthropicUsage::default(),
             finish: None,
             done: false,
+            failed: false,
         }
+    }
+
+    /// Whether the stream ended with an error event.
+    pub fn failed(&self) -> bool {
+        self.failed
     }
 
     pub fn usage(&self) -> Usage {
@@ -532,6 +542,7 @@ impl StreamTranslator {
         write_event(out, None, &error.to_string());
         write_event(out, None, "[DONE]");
         self.done = true;
+        self.failed = true;
     }
 
     pub fn event(&mut self, ev: &SseEvent, out: &mut Vec<u8>) {

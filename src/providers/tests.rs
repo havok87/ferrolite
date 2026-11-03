@@ -792,3 +792,143 @@ fn url_building() {
         "http://h:1/v1/models"
     );
 }
+
+#[tokio::test]
+async fn json_answers_to_stream_requests_are_errors() {
+    let m = mock(|_| {
+        Reply::Json(
+            200,
+            json!({"error": {"message": "streaming is not supported"}}),
+            vec![],
+        )
+    })
+    .await;
+    let g = gateway(m.port, UpstreamOptions::default());
+    let e = upstream_error(
+        g.call(
+            "oa",
+            request(
+                Endpoint::ChatCompletions,
+                json!({"model": "oa", "stream": true, "messages": []}),
+            ),
+        )
+        .await
+        .unwrap_err(),
+    );
+    assert_eq!((e.class, e.status), (ErrorClass::Server, 502));
+    assert!(
+        e.message
+            .contains("without an event stream: streaming is not supported"),
+        "{e}"
+    );
+}
+
+#[tokio::test]
+async fn empty_and_failed_streams_are_reported() {
+    let m = mock(|req| match req.body["model"].as_str() {
+        Some("served-model") if req.body["messages"][0]["content"] == "empty" => {
+            Reply::Sse(vec![], false)
+        }
+        _ => Reply::Sse(
+            vec![
+                OPENAI_STREAM[..OPENAI_STREAM.find("\n\n").unwrap() + 2].to_owned(),
+                "data: {\"error\":{\"message\":\"model crashed\"}}\n\n".to_owned(),
+            ],
+            false,
+        ),
+    })
+    .await;
+    let g = gateway(m.port, UpstreamOptions::default());
+    let body = |content: &str| json!({"model": "oa", "stream": true, "messages": [{"role": "user", "content": content}]});
+
+    let (text, outcome) = stream_text(
+        g.call("oa", request(Endpoint::ChatCompletions, body("empty")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(text.contains("ended without sending any events"), "{text}");
+    assert!(text.ends_with("data: [DONE]\n\n"));
+    assert!(outcome.failed());
+
+    let (text, outcome) = stream_text(
+        g.call("oa", request(Endpoint::ChatCompletions, body("crash")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(text.contains("model crashed"), "{text}");
+    assert!(outcome.failed());
+
+    let (_, outcome) = stream_text(
+        g.call(
+            "claude",
+            request(
+                Endpoint::ChatCompletions,
+                json!({"model": "claude", "stream": true, "messages": []}),
+            ),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    // The claude deployment's mock answer is not an Anthropic stream, so
+    // the translator ends it with an error.
+    assert!(outcome.failed());
+}
+
+#[tokio::test]
+async fn completed_streams_are_not_failures() {
+    let m = mock(|_| Reply::Sse(chunks(OPENAI_STREAM, 50), false)).await;
+    let g = gateway(m.port, UpstreamOptions::default());
+    let (_, outcome) = stream_text(
+        g.call(
+            "oa",
+            request(
+                Endpoint::ChatCompletions,
+                json!({"model": "oa", "stream": true, "messages": []}),
+            ),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(!outcome.failed());
+    assert_eq!(
+        outcome.get(),
+        Some(Usage {
+            prompt: 11,
+            completion: 9
+        })
+    );
+}
+
+#[tokio::test]
+async fn client_steered_upstream_resources_never_reach_the_upstream() {
+    let m = mock(|_| Reply::Json(200, anthropic_message(), vec![])).await;
+    let g = gateway(m.port, UpstreamOptions::default());
+    for (model, endpoint, body) in [
+        (
+            "claude",
+            Endpoint::Messages,
+            json!({"model": "claude", "max_tokens": 5, "messages": [],
+            "mcp_servers": [{"type": "url", "url": "https://attacker.example/mcp", "name": "x"}]}),
+        ),
+        (
+            "oa",
+            Endpoint::Responses,
+            json!({"model": "oa", "input": "hi",
+            "tools": [{"type": "mcp", "server_label": "x", "server_url": "https://attacker.example"}]}),
+        ),
+        (
+            "oa",
+            Endpoint::ChatCompletions,
+            json!({"model": "oa", "messages": [{"role": "user",
+            "content": [{"type": "file", "file": {"file_id": "file-abc"}}]}]}),
+        ),
+    ] {
+        let e = upstream_error(g.call(model, request(endpoint, body)).await.unwrap_err());
+        assert_eq!((e.class, e.status), (ErrorClass::BadRequest, 400), "{e}");
+    }
+    assert!(m.seen().is_empty());
+}

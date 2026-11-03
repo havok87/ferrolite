@@ -28,6 +28,10 @@ pub(super) enum Transform {
         hide_usage: bool,
         scrub: Redactor,
         usage: Usage,
+        /// Events seen; a stream that ends with none is an error.
+        events: u64,
+        /// The upstream reported an error, or the stream broke.
+        failed: bool,
     },
     ToOpenAi(openai_to_anthropic::StreamTranslator),
     ToAnthropic(anthropic_to_openai::StreamTranslator),
@@ -40,6 +44,8 @@ impl Transform {
             hide_usage,
             scrub,
             usage: Usage::default(),
+            events: 0,
+            failed: false,
         }
     }
 
@@ -48,9 +54,19 @@ impl Transform {
             Self::ToOpenAi(t) => t.event(ev, out),
             Self::ToAnthropic(t) => t.event(ev, out),
             Self::Pass {
-                hide_usage, usage, ..
+                hide_usage,
+                usage,
+                events,
+                failed,
+                ..
             } => {
+                *events += 1;
                 if let Ok(data) = serde_json::from_str::<Value>(&ev.data) {
+                    // OpenAI-style `{"error": ...}` chunks, and `type: error`
+                    // events from Anthropic and the Responses API.
+                    if data.get("error").is_some_and(|e| !e.is_null()) || data["type"] == "error" {
+                        *failed = true;
+                    }
                     let found = data
                         .get("usage")
                         .or_else(|| data.pointer("/response/usage"))
@@ -80,8 +96,19 @@ impl Transform {
         match self {
             Self::ToOpenAi(t) => t.finish(error, out),
             Self::ToAnthropic(t) => t.finish(error, out),
-            Self::Pass { format, scrub, .. } => {
-                let Some(message) = error else { return };
+            Self::Pass {
+                format,
+                scrub,
+                events,
+                failed,
+                ..
+            } => {
+                let message = match error {
+                    Some(m) => m,
+                    None if *events == 0 => "the upstream stream ended without sending any events",
+                    None => return,
+                };
+                *failed = true;
                 let message = scrub.redact(message);
                 match format {
                     ClientFormat::OpenAiChat => {
@@ -110,6 +137,15 @@ impl Transform {
             Self::Pass { usage, .. } => *usage,
         }
     }
+
+    /// Whether the stream carried an upstream error or ended badly.
+    fn failed(&self) -> bool {
+        match self {
+            Self::ToOpenAi(t) => t.failed(),
+            Self::ToAnthropic(t) => t.failed(),
+            Self::Pass { failed, .. } => *failed,
+        }
+    }
 }
 
 struct State {
@@ -127,7 +163,7 @@ impl Drop for State {
     /// tokens seen so far count against tpm and the lease is released.
     fn drop(&mut self) {
         let usage = self.transform.usage();
-        self.usage.set(usage);
+        self.usage.set(usage, self.transform.failed());
         if let Some(lease) = self.lease.take() {
             lease.record_tokens(usage.total());
         }

@@ -126,6 +126,23 @@ impl AppState {
     }
 }
 
+/// A JSON response that is never cached.
+pub(crate) fn json_response(
+    status: u16,
+    body: impl Into<axum::body::Body>,
+) -> axum::http::Response<axum::body::Body> {
+    use axum::http::{HeaderValue, StatusCode, header};
+    let mut resp = axum::http::Response::new(body.into());
+    *resp.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
+}
+
 /// The axum application for `state`.
 pub fn app(state: Arc<AppState>) -> axum::Router {
     routes::router(state)

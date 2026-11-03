@@ -23,7 +23,9 @@ use url::Position;
 use crate::config::{Config, Deployment, HeaderValue as ConfigHeader, Provider};
 use crate::router::{Attempt, Classify, ErrorClass, Lease};
 use crate::secrets::Redactor;
-use crate::translate::{self, TranslateError, Usage, anthropic_to_openai, openai_to_anthropic};
+use crate::translate::{
+    self, TranslateError, Usage, anthropic_to_openai, openai_to_anthropic, truncate_chars,
+};
 use stream::{ClientFormat, Transform};
 
 /// Default cap on a non-streaming upstream response body.
@@ -95,17 +97,37 @@ impl ProxyRequest {
 /// A response body stream, already in the client's format.
 pub type ByteStream = Pin<Box<dyn Stream<Item = Bytes> + Send>>;
 
-/// Token counts of a stream, filled in when the stream ends.
+/// How a stream went, filled in when the stream ends.
 #[derive(Debug, Clone, Default)]
-pub struct UsageHandle(Arc<Mutex<Option<Usage>>>);
+pub struct UsageHandle(Arc<Mutex<StreamOutcome>>);
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StreamOutcome {
+    usage: Option<Usage>,
+    failed: bool,
+}
 
 impl UsageHandle {
+    /// Token counts, once the stream has ended.
     pub fn get(&self) -> Option<Usage> {
+        self.outcome().usage
+    }
+
+    /// Whether the stream carried an upstream error, broke, stalled or
+    /// ended without completing.
+    pub fn failed(&self) -> bool {
+        self.outcome().failed
+    }
+
+    fn outcome(&self) -> StreamOutcome {
         *self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn set(&self, usage: Usage) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(usage);
+    fn set(&self, usage: Usage, failed: bool) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = StreamOutcome {
+            usage: Some(usage),
+            failed,
+        };
     }
 }
 
@@ -247,6 +269,7 @@ impl Upstream {
         let stream = request.stream();
         let mut body = request.body.clone();
         translate::sanitize(&mut body);
+        translate::reject_upstream_resources(&body)?;
         drop_listed(&mut body, &d);
         body.insert("model".into(), attempt.upstream_model.clone().into());
 
@@ -358,6 +381,11 @@ impl Upstream {
             return Err(self.http_error(response).await);
         }
         let Attempt { lease, timeout, .. } = attempt;
+        if stream && !is_event_stream(response.headers()) {
+            // Some backends ignore `stream` or report errors with a 200 and
+            // a JSON body; either way there is nothing to stream.
+            return Err(self.not_a_stream(response).await);
+        }
         if stream {
             let usage = UsageHandle::default();
             let body = stream::body(response, timeout, transform, lease, usage.clone());
@@ -465,6 +493,32 @@ impl Upstream {
         Ok(ProxyResponse::Json { body, usage })
     }
 
+    /// A 2xx answer to a streaming request that is not an event stream.
+    async fn not_a_stream(&self, response: reqwest::Response) -> ProviderError {
+        let mut buf = Vec::new();
+        let mut response = response;
+        while buf.len() < MAX_ERROR_BYTES {
+            match response.chunk().await {
+                Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+                _ => break,
+            }
+        }
+        let detail = serde_json::from_slice::<Value>(&buf)
+            .ok()
+            .and_then(|b| error_fields(&b).0)
+            .map(|m| {
+                format!(
+                    ": {}",
+                    truncate_chars(&self.scrub.redact(&m), MAX_ERROR_MESSAGE_CHARS)
+                )
+            })
+            .unwrap_or_default();
+        ProviderError::bad_gateway(
+            ErrorClass::Server,
+            format!("the upstream answered a streaming request without an event stream{detail}"),
+        )
+    }
+
     /// Classifies a non-2xx response and extracts a client-safe message.
     async fn http_error(&self, mut response: reqwest::Response) -> ProviderError {
         let status = response.status().as_u16();
@@ -513,6 +567,17 @@ enum Format {
     Pass,
     AnthropicToOpenAi,
     OpenAiToAnthropic,
+}
+
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| {
+            ct.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream")
+        })
 }
 
 fn drop_listed(body: &mut Map<String, Value>, d: &Deployment) {
@@ -619,12 +684,5 @@ fn classify(
         _ if context => ErrorClass::ContextWindowExceeded,
         _ if policy => ErrorClass::ContentPolicy,
         _ => ErrorClass::BadRequest,
-    }
-}
-
-fn truncate_chars(s: &str, max: usize) -> String {
-    match s.char_indices().nth(max) {
-        Some((i, _)) => format!("{}…", &s[..i]),
-        None => s.to_owned(),
     }
 }

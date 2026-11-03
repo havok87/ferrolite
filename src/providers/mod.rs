@@ -367,6 +367,32 @@ impl Upstream {
         self.json_response(raw, format, &lease)
     }
 
+    /// Checks that a deployment answers `GET .../models` with its configured
+    /// credentials, within `timeout`.
+    pub async fn probe(&self, d: &Deployment, timeout: Duration) -> Result<(), ProviderError> {
+        let (url, headers) = match d.provider {
+            Provider::Anthropic => (
+                anthropic::models_url(&d.api_base),
+                anthropic::headers(d, None, None),
+            ),
+            Provider::OpenAiCompat(_) => (
+                openai_compat::models_url(&d.api_base),
+                openai_compat::headers(d),
+            ),
+        };
+        let request = self.client.get(url).headers(headers).send();
+        match tokio::time::timeout(timeout, request).await {
+            Err(_) => Err(ProviderError {
+                class: ErrorClass::Timeout,
+                status: 504,
+                message: "the upstream did not respond in time".to_owned(),
+            }),
+            Ok(Err(e)) => Err(connect_error(&e)),
+            Ok(Ok(response)) if response.status().is_success() => Ok(()),
+            Ok(Ok(response)) => Err(self.http_error(response).await),
+        }
+    }
+
     /// Reads a non-streaming body, refusing anything over the size cap.
     async fn read_body(&self, mut response: reqwest::Response) -> Result<Bytes, ProviderError> {
         let mut buf = Vec::new();

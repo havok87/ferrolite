@@ -783,4 +783,12 @@ fn url_building() {
     ] {
         assert_eq!(anthropic::messages_url(&base(b)).as_str(), expected);
     }
+    assert_eq!(
+        anthropic::models_url(&base("https://proxy.example/v1/messages")).as_str(),
+        "https://proxy.example/v1/models"
+    );
+    assert_eq!(
+        openai_compat::models_url(&base("http://h:1/v1")).as_str(),
+        "http://h:1/v1/models"
+    );
 }

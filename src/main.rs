@@ -3,10 +3,15 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Parser;
-use ferrolite::config::{self, ConfigError, LoadOptions};
+use ferrolite::config::{self, ConfigError, LoadOptions, Loaded};
+use ferrolite::providers::{DEFAULT_MAX_RESPONSE_BYTES, UpstreamOptions};
 use ferrolite::secrets::Resolver;
+use ferrolite::server::{
+    self, AppState, DEFAULT_MAX_REQUEST_BYTES, ServeOptions, ServerOptions, tls,
+};
 use tracing::level_filters::LevelFilter;
 use tracing::{error, info, warn};
 
@@ -36,6 +41,43 @@ struct Cli {
     /// Load and validate the config, then exit.
     #[arg(long)]
     check: bool,
+
+    /// Largest request body, in MiB [default: general_settings.max_request_size_mb, else 32].
+    #[arg(long, value_parser = positive_mib)]
+    max_request_mb: Option<usize>,
+
+    /// Largest non-streaming upstream response, in MiB [default:
+    /// general_settings.max_response_size_mb, else 64].
+    #[arg(long, value_parser = positive_mib)]
+    max_response_mb: Option<usize>,
+
+    /// Proxied requests in progress at once (streams included); more get 503.
+    #[arg(long, default_value_t = server::DEFAULT_MAX_CONCURRENCY as u32, value_parser = clap::value_parser!(u32).range(1..))]
+    max_concurrency: u32,
+
+    /// Open client connections at once; more are closed on accept.
+    #[arg(long, default_value_t = server::DEFAULT_MAX_CONNECTIONS as u32, value_parser = clap::value_parser!(u32).range(1..))]
+    max_connections: u32,
+
+    /// Seconds to wait when connecting to an upstream.
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=300))]
+    connect_timeout: u64,
+
+    /// PEM certificate chain; serves HTTPS together with --tls-key.
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// PEM private key; must not be readable by group or other.
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+}
+
+/// A positive number of MiB, as bytes.
+fn positive_mib(s: &str) -> Result<usize, String> {
+    match s.parse::<f64>() {
+        Ok(mb) if mb.is_finite() && mb > 0.0 => Ok((mb * 1024.0 * 1024.0) as usize),
+        _ => Err("expected a positive number of MiB".to_owned()),
+    }
 }
 
 fn main() -> ExitCode {
@@ -100,10 +142,105 @@ fn main() -> ExitCode {
     if cli.check {
         return ExitCode::SUCCESS;
     }
-    error!(
-        host = %cli.host,
-        port = cli.port,
-        "the HTTP server is not implemented yet; use --check to validate a config"
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            error!(error = %e, "cannot start the async runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(run(cli, loaded))
+}
+
+async fn run(cli: Cli, loaded: Loaded) -> ExitCode {
+    let options = ServerOptions {
+        max_request_bytes: cli
+            .max_request_mb
+            .or(loaded.config.max_request_bytes)
+            .unwrap_or(DEFAULT_MAX_REQUEST_BYTES),
+        max_concurrency: cli.max_concurrency as usize,
+        upstream: UpstreamOptions {
+            max_response_bytes: cli
+                .max_response_mb
+                .or(loaded.config.max_response_bytes)
+                .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES),
+            connect_timeout: Duration::from_secs(cli.connect_timeout),
+        },
+        ..ServerOptions::default()
+    };
+    let tls = match (&cli.tls_cert, &cli.tls_key) {
+        (Some(cert), Some(key)) => match tls::acceptor(cert, key) {
+            Ok(acceptor) => Some(acceptor),
+            Err(e) => {
+                error!("{e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => None,
+    };
+    if tls.is_none() && !cli.host.is_loopback() {
+        warn!(
+            host = %cli.host,
+            "serving plain HTTP on a non-loopback address; keys and prompts travel unencrypted (use --tls-cert/--tls-key)"
+        );
+    }
+    let state = match AppState::new(loaded, options) {
+        Ok(state) => state,
+        Err(e) => {
+            error!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let listener = match tokio::net::TcpListener::bind((cli.host, cli.port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!(host = %cli.host, port = cli.port, error = %e, "cannot bind");
+            return ExitCode::FAILURE;
+        }
+    };
+    let address = listener
+        .local_addr()
+        .map_or_else(|_| format!("{}:{}", cli.host, cli.port), |a| a.to_string());
+    info!(
+        address,
+        tls = tls.is_some(),
+        max_request_bytes = options.max_request_bytes,
+        max_concurrency = options.max_concurrency,
+        "listening"
     );
-    ExitCode::from(2)
+    let serve_options = ServeOptions {
+        max_connections: cli.max_connections as usize,
+        ..ServeOptions::default()
+    };
+    server::serve(
+        listener,
+        server::app(state),
+        tls,
+        serve_options,
+        shutdown_signal(),
+    )
+    .await;
+    info!("stopped");
+    ExitCode::SUCCESS
+}
+
+/// SIGINT or SIGTERM.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    match signal(SignalKind::terminate()) {
+        Ok(mut term) => {
+            tokio::select! {
+                () = ctrl_c => {}
+                _ = term.recv() => {}
+            }
+        }
+        Err(_) => ctrl_c.await,
+    }
+    info!("shutting down; finishing open requests");
 }

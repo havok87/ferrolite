@@ -58,6 +58,10 @@ pub struct Config {
     pub router: RouterSettings,
     /// `litellm_settings.drop_params`.
     pub drop_params: bool,
+    /// `general_settings.max_request_size_mb`, in bytes.
+    pub max_request_bytes: Option<usize>,
+    /// `general_settings.max_response_size_mb`, in bytes.
+    pub max_response_bytes: Option<usize>,
 }
 
 impl Config {
@@ -806,26 +810,55 @@ fn build(root: &Value, options: &LoadOptions, cx: &mut Cx<'_>) -> Option<Config>
     let router = top.get("router_settings");
     top.finish(Kind::Root, &mut cx.diag);
 
-    let master_key = parse_general(general, options, cx);
+    let general = parse_general(general, options, cx);
     let (litellm, drop_params) = parse_litellm_settings(litellm, cx);
     let router = parse_router_settings(router, litellm, cx);
     let deployments = parse_model_list(model_list, cx);
     check_references(&deployments, &router, &mut cx.diag);
 
     Some(Config {
-        master_key,
+        master_key: general.master_key,
+        max_request_bytes: general.max_request_bytes,
+        max_response_bytes: general.max_response_bytes,
         deployments,
         router,
         drop_params,
     })
 }
 
-fn parse_general(value: Option<&Value>, options: &LoadOptions, cx: &mut Cx<'_>) -> Option<Secret> {
-    let mut sec = Section::new("general_settings".into(), value, &mut cx.diag)?;
+#[derive(Default)]
+struct General {
+    master_key: Option<Secret>,
+    max_request_bytes: Option<usize>,
+    max_response_bytes: Option<usize>,
+}
+
+fn parse_general(value: Option<&Value>, options: &LoadOptions, cx: &mut Cx<'_>) -> General {
+    let Some(mut sec) = Section::new("general_settings".into(), value, &mut cx.diag) else {
+        return General::default();
+    };
     let raw = sec.string("master_key", &mut cx.diag);
     let path = sec.key_path("master_key");
+    let mut megabytes = |key: &str, d: &mut Diag| {
+        sec.positive_f64(key, d)
+            .map(|mb| (mb * 1024.0 * 1024.0) as usize)
+    };
+    let max_request_bytes = megabytes("max_request_size_mb", &mut cx.diag);
+    let max_response_bytes = megabytes("max_response_size_mb", &mut cx.diag);
     sec.finish(Kind::General, &mut cx.diag);
+    General {
+        master_key: check_master_key(raw, &path, options, cx),
+        max_request_bytes,
+        max_response_bytes,
+    }
+}
 
+fn check_master_key(
+    raw: Option<&str>,
+    path: &str,
+    options: &LoadOptions,
+    cx: &mut Cx<'_>,
+) -> Option<Secret> {
     if options.allow_no_auth {
         if !options.bind.is_loopback() {
             cx.diag.error(format!(
@@ -850,7 +883,7 @@ fn parse_general(value: Option<&Value>, options: &LoadOptions, cx: &mut Cx<'_>) 
     if SecretRef::parse(raw).is_ok_and(|r| r.is_literal()) {
         cx.has_literal_secret = true;
     }
-    let key = cx.secret(&path, raw)?;
+    let key = cx.secret(path, raw)?;
     let k = key.expose();
     if !k.starts_with("sk-") {
         cx.diag.error(format!("`{path}` must start with `sk-`"));
@@ -2060,6 +2093,20 @@ model_list:
         ] {
             assert!(has(&p, needle), "missing {needle:?} in {p:#?}");
         }
+    }
+
+    #[test]
+    fn size_limits_from_general_settings() {
+        let yaml = format!("{MODELS}{AUTH}  max_request_size_mb: 8\n  max_response_size_mb: 0.5\n");
+        let l = ok(&yaml);
+        assert_eq!(l.config.max_request_bytes, Some(8 * 1024 * 1024));
+        assert_eq!(l.config.max_response_bytes, Some(512 * 1024));
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        let bad = format!("{MODELS}{AUTH}  max_request_size_mb: 0\n");
+        assert!(has(
+            &problems(&bad),
+            "max_request_size_mb` must be a positive number"
+        ));
     }
 
     #[test]

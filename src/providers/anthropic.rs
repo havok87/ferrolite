@@ -11,16 +11,23 @@ pub const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// `/v1/messages` under `api_base`, unless `api_base` already ends in it.
 pub(super) fn messages_url(base: &Url) -> Url {
-    let trimmed = base.path().trim_end_matches('/');
-    let path = if trimmed.ends_with("/v1/messages") {
-        trimmed.to_owned()
-    } else if trimmed.ends_with("/v1") {
-        format!("{trimmed}/messages")
-    } else {
-        format!("{trimmed}/v1/messages")
-    };
+    v1_url(base, "messages")
+}
+
+/// `/v1/models`, for health probes.
+pub(super) fn models_url(base: &Url) -> Url {
+    v1_url(base, "models")
+}
+
+fn v1_url(base: &Url, leaf: &str) -> Url {
+    let mut trimmed = base.path().trim_end_matches('/');
+    if let Some(stripped) = trimmed.strip_suffix("/v1/messages") {
+        trimmed = stripped;
+    } else if let Some(stripped) = trimmed.strip_suffix("/v1") {
+        trimmed = stripped;
+    }
     let mut url = base.clone();
-    url.set_path(&path);
+    url.set_path(&format!("{trimmed}/v1/{leaf}"));
     url
 }
 

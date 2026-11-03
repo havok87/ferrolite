@@ -154,7 +154,6 @@ impl Health {
         self.state(index).latency
     }
 
-    #[cfg(test)]
     pub(crate) fn is_cooling_down(&self, index: usize, now: Instant) -> bool {
         self.state(index)
             .cooldown_until

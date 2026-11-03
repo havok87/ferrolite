@@ -90,6 +90,15 @@ impl<E: Classify> RouterError<E> {
     }
 }
 
+/// A deployment's current state, for health and metrics endpoints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentStatus {
+    pub id: String,
+    pub model_group: String,
+    pub in_flight: u64,
+    pub cooling_down: bool,
+}
+
 pub struct Router {
     deployments: Vec<Arc<Deployment>>,
     settings: RouterSettings,
@@ -124,6 +133,21 @@ impl Router {
             health: Health::new(config.deployments.len()),
             rng: Mutex::new(rng),
         }
+    }
+
+    /// Every deployment's state right now, in config order.
+    pub fn snapshot(&self) -> Vec<DeploymentStatus> {
+        let now = Instant::now();
+        self.deployments
+            .iter()
+            .enumerate()
+            .map(|(i, d)| DeploymentStatus {
+                id: d.id.clone(),
+                model_group: d.model_name.clone(),
+                in_flight: self.health.in_flight(i),
+                cooling_down: self.health.is_cooling_down(i, now),
+            })
+            .collect()
     }
 
     pub fn resolve(&self, model: &str) -> Option<Resolved> {

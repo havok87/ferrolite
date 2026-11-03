@@ -10,6 +10,7 @@ pub mod config;
 pub mod providers;
 pub mod router;
 pub mod secrets;
+pub mod server;
 pub mod translate;
 
 #[cfg(test)]

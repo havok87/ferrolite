@@ -307,6 +307,12 @@ impl<'a> Resolver<'a> {
     }
 }
 
+/// Reads a file that must be private to its owner, such as a TLS key, with
+/// the same checks as `file/` secret references.
+pub fn read_private_file(path: &Path) -> Result<Secret, SecretError> {
+    read_secret_file(path)
+}
+
 /// Reads a secret file, refusing anything group/other can access.
 ///
 /// The path is checked with `stat` before opening, so a FIFO or device is never

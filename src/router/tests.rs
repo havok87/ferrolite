@@ -384,8 +384,13 @@ async fn cooldown_after_allowed_fails_and_recovery() {
         .unwrap();
     assert_eq!(routed.deployment_id, "m#1");
 
+    let snap = r.snapshot();
+    assert!(snap[m0].cooling_down && !snap[r.index_of("m#1")].cooling_down);
+    assert_eq!(snap[m0].model_group, "m");
+
     tokio::time::advance(Duration::from_secs(31)).await;
     assert!(r.pick(&r.resolve("m").unwrap(), &[]) == Some(m0));
+    assert!(!r.snapshot()[m0].cooling_down);
 }
 
 #[tokio::test(start_paused = true)]

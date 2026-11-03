@@ -9,9 +9,17 @@ use crate::config::Deployment;
 
 /// `<api_base>/<endpoint>`, e.g. `http://127.0.0.1:8000/v1/chat/completions`.
 pub(super) fn url(base: &Url, endpoint: Endpoint) -> Url {
+    join(base, endpoint.path())
+}
+
+/// `<api_base>/models`, for health probes.
+pub(super) fn models_url(base: &Url) -> Url {
+    join(base, "models")
+}
+
+fn join(base: &Url, leaf: &str) -> Url {
     let mut url = base.clone();
-    let path = format!("{}/{}", base.path().trim_end_matches('/'), endpoint.path());
-    url.set_path(&path);
+    url.set_path(&format!("{}/{leaf}", base.path().trim_end_matches('/')));
     url
 }
 

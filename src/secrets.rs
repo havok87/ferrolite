@@ -402,6 +402,23 @@ impl Redactor {
         }
     }
 
+    /// This redactor plus more patterns that are not secrets but should not
+    /// reach clients either, such as upstream hostnames.
+    pub fn with_patterns(&self, extra: impl IntoIterator<Item = String>) -> Self {
+        let mut patterns: Vec<Box<str>> = self.patterns.iter().cloned().collect();
+        patterns.extend(
+            extra
+                .into_iter()
+                .filter(|p| p.chars().count() >= MIN_REDACTABLE_CHARS)
+                .map(String::into_boxed_str),
+        );
+        patterns.sort_unstable();
+        patterns.dedup();
+        Self {
+            patterns: patterns.into(),
+        }
+    }
+
     pub fn is_redactable(secret: &Secret) -> bool {
         secret.expose().chars().count() >= MIN_REDACTABLE_CHARS
     }
@@ -743,6 +760,16 @@ mod tests {
         let r = Redactor::new([&s]);
         assert!(matches!(r.redact("nothing to see"), Cow::Borrowed(_)));
         assert!(matches!(Redactor::default().redact("x"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn adds_extra_patterns() {
+        let s = Secret::new("sk-aaaaaaaaaaaa");
+        let r = Redactor::new([&s]).with_patterns(["10.0.0.7:8000".to_owned(), "short".to_owned()]);
+        assert_eq!(
+            r.redact("sk-aaaaaaaaaaaa at http://10.0.0.7:8000 short"),
+            "[REDACTED] at http://[REDACTED] short"
+        );
     }
 
     #[test]

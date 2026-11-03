@@ -182,6 +182,10 @@ pub struct Deployment {
     pub timeout: Option<Duration>,
     pub stream_timeout: Option<Duration>,
     pub extra_headers: Vec<(String, HeaderValue)>,
+    /// Per-deployment `drop_params`; overrides `litellm_settings.drop_params`.
+    pub drop_params: Option<bool>,
+    /// Request parameters always removed before calling this deployment.
+    pub additional_drop_params: Vec<String>,
     /// Extra `litellm_params` keys, applied as request defaults.
     pub defaults: Map<String, Value>,
     pub model_info: ModelInfo,
@@ -1117,6 +1121,15 @@ fn parse_deployment(
     let timeout = params.seconds("timeout", false, d);
     let stream_timeout = params.seconds("stream_timeout", false, d);
     let headers_value = params.get("extra_headers");
+    let drop_params = params.bool("drop_params", d);
+    let additional_drop_params = params
+        .typed("additional_drop_params", "a list of strings", d, |v| {
+            v.as_array()?
+                .iter()
+                .map(|x| x.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+        })
+        .unwrap_or_default();
     let headers_path = params.key_path("extra_headers");
     let model_path = params.key_path("model");
 
@@ -1190,6 +1203,8 @@ fn parse_deployment(
         timeout,
         stream_timeout,
         extra_headers,
+        drop_params,
+        additional_drop_params,
         defaults,
         model_info,
     })
@@ -2045,6 +2060,21 @@ model_list:
         ] {
             assert!(has(&p, needle), "missing {needle:?} in {p:#?}");
         }
+    }
+
+    #[test]
+    fn per_deployment_drop_params() {
+        let yaml = format!(
+            "{MODELS}      drop_params: true\n      additional_drop_params: [logprobs, seed]\n{AUTH}"
+        );
+        let l = ok(&yaml);
+        let d = &l.config.deployments[0];
+        assert_eq!(d.drop_params, Some(true));
+        assert_eq!(d.additional_drop_params, ["logprobs", "seed"]);
+        assert!(d.defaults.is_empty(), "{:?}", d.defaults);
+
+        let bad = format!("{MODELS}      additional_drop_params: logprobs\n{AUTH}");
+        assert!(has(&problems(&bad), "must be a list of strings"));
     }
 
     #[test]

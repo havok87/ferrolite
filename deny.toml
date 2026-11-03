@@ -2,6 +2,14 @@
 
 [graph]
 all-features = false
+# Only the platforms ferrolite ships for; crates used solely elsewhere
+# (e.g. Android's jni via rustls-platform-verifier) are never built.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
 
 [advisories]
 version = 2

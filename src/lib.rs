@@ -7,8 +7,10 @@
 compile_error!("ferrolite supports macOS and Linux only");
 
 pub mod config;
+pub mod providers;
 pub mod router;
 pub mod secrets;
+pub mod translate;
 
 #[cfg(test)]
 pub(crate) mod test_support;

@@ -1,0 +1,26 @@
+# Weekly update PRs for Cargo dependencies and the pinned action SHAs.
+#
+# `cooldown` waits a week after a release before proposing it, so a
+# compromised version has time to be noticed and yanked before it lands
+# here; security updates are not delayed by it.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

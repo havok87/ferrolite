@@ -70,14 +70,15 @@ impl Route {
     }
 }
 
-/// Status codes ferrolite can answer with; anything else counts as "other".
-const CODES: [u16; 13] = [
-    200, 400, 401, 404, 405, 408, 413, 422, 429, 500, 502, 503, 504,
+/// Status codes ferrolite can answer with (499: the client went away);
+/// anything else counts as "other".
+const CODES: [u16; 14] = [
+    200, 400, 401, 404, 405, 408, 413, 422, 429, 499, 500, 502, 503, 504,
 ];
 const BUCKETS: [f64; 12] = [
     0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
 ];
-const ERROR_CLASSES: [&str; 11] = [
+const ERROR_CLASSES: [&str; 12] = [
     "rate_limited",
     "server",
     "timeout",
@@ -89,6 +90,7 @@ const ERROR_CLASSES: [&str; 11] = [
     "bad_request",
     "no_deployment",
     "unknown_model",
+    "stream_failed",
 ];
 
 /// The label for an error class (also used by `/health`).

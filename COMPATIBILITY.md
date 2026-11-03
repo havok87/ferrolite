@@ -57,6 +57,15 @@ any `litellm_*` key. Client auth headers are never forwarded upstream.
 Adding or deleting models over the API isn't available, and remote images
 or files are never fetched on a client's behalf.
 
+Requests that would have the upstream act, with the gateway's
+credentials, on resources the client picks are refused with a 400 before
+any upstream is called:
+- Anthropic `mcp_servers`, and `mcp` or `mcp_toolset` tools (including
+  Responses API `mcp` tools with a `server_url`)
+- `file_id` anywhere in the body, since stored files belong to the
+  gateway's upstream account
+- Anthropic `container`
+
 ## Not supported yet
 
 | Feature | What happens now |

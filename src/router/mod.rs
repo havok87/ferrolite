@@ -72,7 +72,11 @@ pub enum RouterError<E> {
     #[error("model `{model}` is not configured")]
     UnknownModel { model: String },
     #[error("no deployment of `{group}` is available (cooling down or rate limited)")]
-    NoDeployment { group: String },
+    NoDeployment {
+        group: String,
+        /// When the first of the group's deployments frees up.
+        retry_after: Duration,
+    },
     #[error("deployment `{deployment}` timed out after {}s", after.as_secs_f64())]
     Timeout { deployment: String, after: Duration },
     #[error("deployment `{deployment}` failed: {error}")]
@@ -245,14 +249,12 @@ impl Router {
         let mut last: Option<RouterError<E>> = None;
 
         for retry in 0..max_attempts {
-            let Some(index) = self.pick(resolved, &failed) else {
-                return Err(last.unwrap_or_else(|| RouterError::NoDeployment {
-                    group: resolved.group.clone(),
-                }));
+            let started = Instant::now();
+            let Some((index, lease)) = self.pick_and_acquire(resolved, &failed, started) else {
+                return Err(last.unwrap_or_else(|| self.no_deployment(resolved, started)));
             };
             let deployment = Arc::clone(&self.deployments[index]);
             let timeout = self.timeout_for(&deployment, hints);
-            let started = Instant::now();
             *attempts += 1;
             let attempt = Attempt {
                 upstream_model: resolve::upstream_model(
@@ -262,7 +264,7 @@ impl Router {
                 deployment: Arc::clone(&deployment),
                 timeout,
                 number: *attempts,
-                lease: self.health.acquire(index, started),
+                lease,
             };
 
             let (class, err) = match tokio::time::timeout(timeout, call(attempt)).await {
@@ -306,31 +308,66 @@ impl Router {
             let wait = retry::delay(class, retry, &mut self.rng());
             tokio::time::sleep(wait).await;
         }
-        Err(last.unwrap_or_else(|| RouterError::NoDeployment {
-            group: resolved.group.clone(),
-        }))
+        Err(last.unwrap_or_else(|| self.no_deployment(resolved, Instant::now())))
     }
 
-    /// Picks an eligible deployment of the group: available, in the lowest
-    /// `order` tier present, then chosen by the routing strategy. Deployments
-    /// in `avoid` are used only if nothing else is eligible.
+    fn no_deployment<E>(&self, resolved: &Resolved, now: Instant) -> RouterError<E> {
+        let limits = resolved.candidates.iter().map(|&i| (i, self.limits(i)));
+        RouterError::NoDeployment {
+            group: resolved.group.clone(),
+            retry_after: self.health.available_in(limits, now),
+        }
+    }
+
+    fn limits(&self, index: usize) -> Limits {
+        let d = &self.deployments[index];
+        Limits {
+            rpm: d.rpm,
+            tpm: d.tpm,
+        }
+    }
+
+    /// Picks a deployment and takes a request slot on it. If another request
+    /// took the last slot between the pick and the reservation, picks again
+    /// without that deployment.
+    fn pick_and_acquire(
+        &self,
+        resolved: &Resolved,
+        avoid: &[usize],
+        now: Instant,
+    ) -> Option<(usize, Lease)> {
+        let mut lost: Vec<usize> = Vec::new();
+        loop {
+            let index = self.pick_excluding(resolved, avoid, &lost)?;
+            match self.health.try_acquire(index, now, self.limits(index)) {
+                Some(lease) => return Some((index, lease)),
+                None => lost.push(index),
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn pick(&self, resolved: &Resolved, avoid: &[usize]) -> Option<usize> {
+        self.pick_excluding(resolved, avoid, &[])
+    }
+
+    /// Picks an eligible deployment of the group, never one in `excluded`:
+    /// available, in the lowest `order` tier present, then chosen by the
+    /// routing strategy. Deployments in `avoid` are used only if nothing
+    /// else is eligible.
+    fn pick_excluding(
+        &self,
+        resolved: &Resolved,
+        avoid: &[usize],
+        excluded: &[usize],
+    ) -> Option<usize> {
         let now = Instant::now();
         let available: Vec<usize> = resolved
             .candidates
             .iter()
             .copied()
-            .filter(|&i| {
-                let d = &self.deployments[i];
-                self.health.is_available(
-                    i,
-                    now,
-                    Limits {
-                        rpm: d.rpm,
-                        tpm: d.tpm,
-                    },
-                )
-            })
+            .filter(|i| !excluded.contains(i))
+            .filter(|&i| self.health.is_available(i, now, self.limits(i)))
             .collect();
         let fresh: Vec<usize> = available
             .iter()

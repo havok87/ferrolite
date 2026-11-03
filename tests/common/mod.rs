@@ -37,6 +37,8 @@ pub struct Seen {
 
 pub enum Reply {
     Json(u16, Value),
+    /// A JSON answer sent only after a delay.
+    JsonAfter(Duration, u16, Value),
     /// SSE chunks, each sent after `delay`; `stall` keeps the stream open after the last.
     Sse {
         chunks: Vec<String>,
@@ -68,7 +70,7 @@ impl Mock {
                     };
                     let r = reply(&req);
                     log.lock().unwrap().push(req);
-                    respond(r)
+                    respond(r).await
                 }
             },
         );
@@ -93,8 +95,12 @@ impl Mock {
     }
 }
 
-fn respond(reply: Reply) -> Response<Body> {
+async fn respond(reply: Reply) -> Response<Body> {
     match reply {
+        Reply::JsonAfter(delay, status, v) => {
+            tokio::time::sleep(delay).await;
+            Box::pin(respond(Reply::Json(status, v))).await
+        }
         Reply::Json(status, v) => Response::builder()
             .status(status)
             .header("content-type", "application/json")

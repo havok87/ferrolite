@@ -40,6 +40,19 @@ struct State {
 }
 
 impl State {
+    fn available(&mut self, now: Instant, window: u64, limits: Limits) -> bool {
+        if let Some(until) = self.cooldown_until {
+            if now < until {
+                return false;
+            }
+            self.cooldown_until = None;
+            self.fails = 0;
+        }
+        self.roll(window);
+        limits.rpm.is_none_or(|rpm| self.requests < rpm)
+            && limits.tpm.is_none_or(|tpm| self.tokens < tpm)
+    }
+
     fn roll(&mut self, window: u64) {
         if self.window != window {
             self.window = window;
@@ -80,21 +93,71 @@ impl Health {
     /// Not cooling down and under its rpm/tpm limits for this minute.
     pub(crate) fn is_available(&self, index: usize, now: Instant, limits: Limits) -> bool {
         let window = self.window(now);
-        let mut st = self.state(index);
-        if let Some(until) = st.cooldown_until {
-            if now < until {
-                return false;
+        self.state(index).available(now, window, limits)
+    }
+
+    /// Takes a request slot if the deployment is available. The check and
+    /// the rpm count happen under one lock, so concurrent requests cannot
+    /// both take the last slot of a minute.
+    pub(crate) fn try_acquire(
+        self: &Arc<Self>,
+        index: usize,
+        now: Instant,
+        limits: Limits,
+    ) -> Option<Lease> {
+        let window = self.window(now);
+        {
+            let mut st = self.state(index);
+            if !st.available(now, window, limits) {
+                return None;
             }
-            st.cooldown_until = None;
-            st.fails = 0;
+            st.requests += 1;
         }
-        st.roll(window);
-        limits.rpm.is_none_or(|rpm| st.requests < rpm)
-            && limits.tpm.is_none_or(|tpm| st.tokens < tpm)
+        self.deployments[index]
+            .in_flight
+            .fetch_add(1, Ordering::Relaxed);
+        Some(Lease {
+            health: Arc::clone(self),
+            index,
+        })
+    }
+
+    /// How long until one of `deployments` can take a request again: the
+    /// end of its cooldown, or the next minute if it is over rpm/tpm.
+    pub(crate) fn available_in(
+        &self,
+        deployments: impl IntoIterator<Item = (usize, Limits)>,
+        now: Instant,
+    ) -> Duration {
+        let window = self.window(now);
+        let next_window = self.epoch + Duration::from_secs((window + 1) * WINDOW_SECS);
+        deployments
+            .into_iter()
+            .map(|(index, limits)| {
+                let st = self.state(index);
+                if let Some(until) = st.cooldown_until.filter(|u| now < *u) {
+                    return until - now;
+                }
+                let (requests, tokens) = if st.window == window {
+                    (st.requests, st.tokens)
+                } else {
+                    (0, 0)
+                };
+                let over = limits.rpm.is_some_and(|rpm| requests >= rpm)
+                    || limits.tpm.is_some_and(|tpm| tokens >= tpm);
+                if over {
+                    next_window.saturating_duration_since(now)
+                } else {
+                    Duration::ZERO
+                }
+            })
+            .min()
+            .unwrap_or(Duration::ZERO)
     }
 
     /// Counts a request against the deployment and returns the lease that
-    /// keeps it in flight.
+    /// keeps it in flight, without checking limits.
+    #[cfg(test)]
     pub(crate) fn acquire(self: &Arc<Self>, index: usize, now: Instant) -> Lease {
         let window = self.window(now);
         {

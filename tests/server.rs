@@ -76,6 +76,15 @@ fn good(req: &Seen) -> Reply {
         ),
         "up-slow" => sse(OPENAI_SSE, Duration::from_millis(200), false),
         "up-stall" => sse(&OPENAI_SSE[..1], Duration::ZERO, true),
+        "up-crash" => sse(
+            &[
+                OPENAI_SSE[0],
+                "data: {\"error\":{\"message\":\"model crashed\"}}\n\n",
+            ],
+            Duration::ZERO,
+            false,
+        ),
+        "up-slowjson" => Reply::JsonAfter(Duration::from_secs(2), 200, chat("late")),
         _ if stream => sse(OPENAI_SSE, Duration::ZERO, false),
         _ => Reply::Json(200, chat("Hi")),
     }
@@ -101,6 +110,8 @@ model_list:
   - {{model_name: slow, litellm_params: {{model: hosted_vllm/up-slow, api_base: "http://127.0.0.1:{a}/v1"}}}}
   - {{model_name: stall, litellm_params: {{model: hosted_vllm/up-stall, api_base: "http://127.0.0.1:{a}/v1"}}}}
   - {{model_name: limited, litellm_params: {{model: hosted_vllm/up-gpt, api_base: "http://127.0.0.1:{a}/v1", rpm: 1}}}}
+  - {{model_name: crash, litellm_params: {{model: hosted_vllm/up-crash, api_base: "http://127.0.0.1:{a}/v1"}}}}
+  - {{model_name: slowjson, litellm_params: {{model: hosted_vllm/up-slowjson, api_base: "http://127.0.0.1:{a}/v1"}}}}
 router_settings:
   num_retries: 0
   allowed_fails: 0
@@ -435,7 +446,9 @@ async fn no_available_deployment_is_429() {
     )
     .await;
     assert_eq!(status, 429);
-    assert_eq!(headers["retry-after"], "60");
+    // The rpm window resets within the minute.
+    let after: u64 = headers["retry-after"].to_str().unwrap().parse().unwrap();
+    assert!((1..=60).contains(&after), "{after}");
     assert_eq!(body["error"]["type"], "rate_limit_error");
 }
 
@@ -645,7 +658,7 @@ async fn health_probes_backends_by_deployment_id() {
         .collect();
     assert_eq!(unhealthy, ["flaky#0", "primary#0"]);
     assert_eq!(body["unhealthy_endpoints"][0]["error"], "server");
-    assert_eq!(body["healthy_count"], 9);
+    assert_eq!(body["healthy_count"], 11);
     assert!(!body.to_string().contains("127.0.0.1"));
     let probe = s
         .good
@@ -772,4 +785,79 @@ async fn shutdown_lets_open_streams_finish() {
         .unwrap();
     // No new connections after shutdown.
     assert!(tokio::net::TcpStream::connect(s.gw.addr).await.is_err());
+}
+
+// ---- review fixes ----
+
+/// Polls `/metrics` until it contains `line`.
+async fn wait_for_metric(gw: &Gateway, line: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let m = text(gw.get("/metrics", true).await).await;
+        if m.contains(line) {
+            return m;
+        }
+        assert!(Instant::now() < deadline, "never saw {line}\n{m}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn failed_streams_are_counted_as_failures() {
+    let s = setup().await;
+    let mut body = chat_body("crash");
+    body["stream"] = true.into();
+    let resp = s.gw.post("/v1/chat/completions", &body).await;
+    assert_eq!(resp.status(), 200);
+    assert!(text(resp).await.contains("model crashed"));
+    let m = wait_for_metric(
+        &s.gw,
+        "ferrolite_requests_total{route=\"/v1/chat/completions\",code=\"502\"} 1",
+    )
+    .await;
+    assert!(
+        m.contains(
+            "ferrolite_upstream_errors_total{model_group=\"crash\",class=\"stream_failed\"} 1"
+        ),
+        "{m}"
+    );
+    assert!(!m.contains("code=\"200\""), "{m}");
+}
+
+#[tokio::test]
+async fn requests_the_client_abandons_are_still_counted() {
+    let s = setup().await;
+    let impatient = reqwest::Client::builder()
+        .timeout(Duration::from_millis(300))
+        .build()
+        .unwrap();
+    let sent = impatient
+        .post(s.gw.url("/v1/chat/completions"))
+        .header("authorization", format!("Bearer {MASTER_KEY}"))
+        .body(chat_body("slowjson").to_string())
+        .send()
+        .await;
+    assert!(sent.is_err(), "the request should have timed out");
+    wait_for_metric(
+        &s.gw,
+        "ferrolite_requests_total{route=\"/v1/chat/completions\",code=\"499\"} 1",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn clients_cannot_attach_mcp_servers() {
+    let s = setup().await;
+    let body = json!({"model": "claude", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}],
+        "mcp_servers": [{"type": "url", "url": "https://attacker.example/mcp", "name": "x"}]});
+    let (status, _, resp) = json(s.gw.post("/v1/messages", &body).await).await;
+    assert_eq!(status, 400);
+    assert_eq!(resp["error"]["type"], "invalid_request_error");
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("mcp_servers")
+    );
+    assert!(s.good.calls_for("up-claude").is_empty());
 }

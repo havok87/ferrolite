@@ -29,14 +29,12 @@ fn err(msg: impl Into<String>) -> TranslateError {
 /// Translates a Messages API body (with `model` already set to the
 /// upstream model) into a chat completions body.
 pub fn request(body: &Map<String, Value>, drop_params: bool) -> Result<Value, TranslateError> {
-    let mut body = body.clone();
-    check_params(
-        &mut body,
-        supported,
-        drop_params,
-        "OpenAI-compatible backends",
-    )?;
-    let get = |k: &str| body.get(k).filter(|v| !v.is_null());
+    let dropped = check_params(body, supported, drop_params, "OpenAI-compatible backends")?;
+    let get = |k: &str| {
+        body.get(k)
+            .filter(|v| !v.is_null())
+            .filter(|_| !dropped.contains(&k))
+    };
 
     let mut messages: Vec<Value> = Vec::new();
     if let Some(system) = get("system") {
@@ -387,6 +385,7 @@ pub struct StreamTranslator {
     stop_reason: Option<&'static str>,
     usage: OpenAiUsage,
     done: bool,
+    failed: bool,
 }
 
 impl StreamTranslator {
@@ -400,7 +399,13 @@ impl StreamTranslator {
             stop_reason: None,
             usage: OpenAiUsage::default(),
             done: false,
+            failed: false,
         }
+    }
+
+    /// Whether the stream ended with an error event.
+    pub fn failed(&self) -> bool {
+        self.failed
     }
 
     pub fn usage(&self) -> Usage {
@@ -565,6 +570,7 @@ impl StreamTranslator {
             &json!({"type": "error", "error": {"type": "api_error", "message": self.scrub.redact(message)}}),
         );
         self.done = true;
+        self.failed = true;
     }
 
     /// Ends the stream. A stream that stops after its finish reason but

@@ -788,7 +788,15 @@ async fn reports_no_deployment_without_fallbacks() {
         .execute("solo", Hints::default(), call_with(&calls, ok))
         .await
         .unwrap_err();
-    assert!(matches!(err, RouterError::NoDeployment { group } if group == "solo"));
+    let RouterError::NoDeployment { group, retry_after } = err else {
+        panic!("expected NoDeployment, got {err:?}");
+    };
+    assert_eq!(group, "solo");
+    // The rpm window resets at the next minute.
+    assert!(
+        retry_after > Duration::ZERO && retry_after <= Duration::from_secs(60),
+        "{retry_after:?}"
+    );
 }
 
 // ---- leases ----
@@ -830,4 +838,74 @@ async fn attempt_numbers_count_across_fallbacks() {
     .await
     .unwrap();
     assert_eq!(*numbers.lock().unwrap(), [1, 2, 3]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpm_limit_holds_under_concurrency() {
+    let r = Arc::new(router(&[("solo", "rpm: 1")], ""));
+    let calls = Calls::default();
+    let tasks: Vec<_> = (0..20)
+        .map(|_| {
+            let r = Arc::clone(&r);
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                r.execute("solo", Hints::default(), |a: Attempt| {
+                    calls.push(&a.deployment.id);
+                    async {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Ok::<(), Fail>(())
+                    }
+                })
+                .await
+                .is_ok()
+            })
+        })
+        .collect();
+    let mut ok = 0;
+    for t in tasks {
+        ok += usize::from(t.await.unwrap());
+    }
+    assert_eq!(ok, 1, "rpm: 1 let {ok} requests through");
+    assert_eq!(calls.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_after_tracks_cooldown() {
+    let r = router(
+        &[("m", ""), ("m", "")],
+        "router_settings:\n  allowed_fails: 0\n  cooldown_time: 45\n",
+    );
+    let now = Instant::now();
+    for id in ["m#0", "m#1"] {
+        r.health
+            .record_failure(r.index_of(id), now, 0, Duration::from_secs(45), true);
+    }
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let calls = Calls::default();
+    let err = r
+        .execute("m", Hints::default(), call_with(&calls, ok))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RouterError::NoDeployment { retry_after, .. } if retry_after == Duration::from_secs(40)),
+        "{err:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn reservation_rechecks_the_limit() {
+    let r = router(&[("solo", "rpm: 1")], "");
+    let i = r.index_of("solo#0");
+    let limits = r.limits(i);
+    let now = Instant::now();
+    // Both requests see the deployment as available...
+    assert!(r.health.is_available(i, now, limits));
+    assert!(r.health.is_available(i, now, limits));
+    // ...but only one can take the minute's single slot.
+    let first = r.health.try_acquire(i, now, limits);
+    assert!(first.is_some());
+    assert!(r.health.try_acquire(i, now, limits).is_none());
+    assert_eq!(r.health.in_flight(i), 1);
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert!(r.health.try_acquire(i, Instant::now(), limits).is_some());
 }

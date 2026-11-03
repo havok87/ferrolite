@@ -170,7 +170,7 @@ deployment's `api_key`, `api_base` and `extra_headers` values.
 | `litellm_params.api_base` | Upstream base URL. It must be http(s) with no credentials, query string or fragment. ferrolite warns for plain `http://` to a public host |
 | `litellm_params.api_key` | Upstream key (a secret reference or a literal) |
 | `litellm_params.custom_llm_provider` | Alternative to the prefix in `model` |
-| `litellm_params.rpm`, `tpm` | Per-minute limits for this deployment. Also used as weights for simple-shuffle |
+| `litellm_params.rpm`, `tpm` | Per-minute limits for this deployment, also used as weights for simple-shuffle. `rpm` is enforced exactly. `tpm` counts tokens as responses finish, so requests already in flight can carry a minute past it |
 | `litellm_params.weight` | Weight for simple-shuffle |
 | `litellm_params.order` | Priority tier. Lower goes first, and deployments without an `order` come last |
 | `litellm_params.timeout`, `stream_timeout` | Seconds per attempt. `stream_timeout` is used for streaming requests |
@@ -234,7 +234,9 @@ and the specific fallback lists are also accepted under `litellm_settings`
 The key can be sent as `Authorization: Bearer`, `x-api-key` or `api-key`.
 Errors use OpenAI's shape, or Anthropic's on `/v1/messages`. `/v1/models`
 and `/model/info` never include keys, `api_base` or headers. Every response
-carries an `x-request-id`.
+carries an `x-request-id`. When no deployment of a group is available, the
+answer is 429 with a `Retry-After` set to when the first one frees up (its
+cooldown ending, or the next minute for an rpm/tpm limit).
 
 ## Logs and metrics
 
@@ -245,8 +247,11 @@ completions or headers:
 {"timestamp":"…","level":"INFO","fields":{"message":"request","request_id":"2a7f059c-…","route":"/v1/chat/completions","model_group":"gpt-4o","deployment":"gpt-4o#0","status":200,"latency_ms":412,"prompt_tokens":9,"completion_tokens":12,"attempts":1},"target":"ferrolite::server::routes"}
 ```
 
-Deployments are identified as `model_name#index`, never by URL. `/metrics`
-exports these series:
+Deployments are identified as `model_name#index`, never by URL. A request
+whose client disconnects before the answer is logged with status 499. A
+stream that carried an upstream error or broke off is logged as 502 and
+counted as a `stream_failed` upstream error (its HTTP status was already
+200). `/metrics` exports these series:
 - `ferrolite_requests_total{route,code}`
 - `ferrolite_request_duration_seconds{route}`
 - `ferrolite_tokens_total{model_group,kind}`

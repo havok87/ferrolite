@@ -2,7 +2,7 @@
 //! error shapes.
 
 use axum::body::Body;
-use axum::http::{HeaderValue, Response, StatusCode, header};
+use axum::http::{HeaderValue, Response, header};
 use serde_json::{Value, json};
 
 use crate::providers::ProviderError;
@@ -44,20 +44,19 @@ impl ApiError {
         self
     }
 
-    /// Maps a routing failure. `cooldown` is the configured cooldown, which
-    /// is a fair `Retry-After` when no deployment is available.
-    pub fn from_router(err: &RouterError<ProviderError>, cooldown_secs: u64) -> Self {
+    /// Maps a routing failure to what the client sees.
+    pub fn from_router(err: &RouterError<ProviderError>) -> Self {
         match err {
             RouterError::UnknownModel { model } => Self::new(
                 404,
-                format!("model `{}` is not configured", truncate(model, 200)),
+                format!("model `{}` is not configured", crate::translate::truncate_chars(model, 200)),
             )
             .with_code("model_not_found"),
-            RouterError::NoDeployment { group } => Self::new(
+            RouterError::NoDeployment { group, retry_after } => Self::new(
                 429,
                 format!("no deployment of `{group}` is available right now (cooling down or rate limited)"),
             )
-            .with_retry_after(cooldown_secs),
+            .with_retry_after(retry_after.as_secs_f64().ceil() as u64),
             RouterError::Timeout { .. } => Self::new(504, "the upstream did not respond in time"),
             RouterError::Upstream { error, .. } => {
                 let mut e = Self::new(client_status(error.status), error.message.clone());
@@ -117,17 +116,10 @@ impl ApiError {
     }
 
     pub fn response(&self, format: ErrorFormat) -> Response<Body> {
-        let mut resp = Response::new(Body::from(self.body(format).to_string()));
-        *resp.status_mut() =
-            StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let h = resp.headers_mut();
-        h.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        let mut resp = super::json_response(self.status, self.body(format).to_string());
         if let Some(after) = self.retry_after {
-            h.insert(header::RETRY_AFTER, HeaderValue::from(after));
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(after));
         }
         resp
     }
@@ -149,13 +141,6 @@ pub fn client_status(upstream: u16) -> u16 {
         529 => 503,
         402..=499 => 400,
         _ => 502,
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    match s.char_indices().nth(max) {
-        Some((i, _)) => format!("{}…", &s[..i]),
-        None => s.to_owned(),
     }
 }
 
@@ -199,29 +184,31 @@ mod tests {
 
     #[test]
     fn router_errors() {
-        let e = ApiError::from_router(
-            &RouterError::UnknownModel {
-                model: "nope".into(),
-            },
-            5,
-        );
+        let e = ApiError::from_router(&RouterError::UnknownModel {
+            model: "nope".into(),
+        });
         assert_eq!((e.status, e.code), (404, Some("model_not_found")));
 
-        let e = ApiError::from_router(&RouterError::NoDeployment { group: "m".into() }, 30);
+        let e = ApiError::from_router(&RouterError::NoDeployment {
+            group: "m".into(),
+            retry_after: Duration::from_millis(29_200),
+        });
         assert_eq!((e.status, e.retry_after), (429, Some(30)));
+        let e = ApiError::from_router(&RouterError::NoDeployment {
+            group: "m".into(),
+            retry_after: Duration::ZERO,
+        });
+        assert_eq!(e.retry_after, Some(1));
 
-        let e = ApiError::from_router(
-            &upstream(
-                ErrorClass::RateLimited {
-                    retry_after: Some(Duration::from_millis(1500)),
-                },
-                429,
-            ),
-            5,
-        );
+        let e = ApiError::from_router(&upstream(
+            ErrorClass::RateLimited {
+                retry_after: Some(Duration::from_millis(1500)),
+            },
+            429,
+        ));
         assert_eq!((e.status, e.retry_after), (429, Some(2)));
 
-        let e = ApiError::from_router(&upstream(ErrorClass::ContextWindowExceeded, 400), 5);
+        let e = ApiError::from_router(&upstream(ErrorClass::ContextWindowExceeded, 400));
         assert_eq!(e.code, Some("context_length_exceeded"));
         assert_eq!(e.message, "upstream said no");
     }

@@ -28,6 +28,50 @@ pub fn sanitize(body: &mut Map<String, Value>) {
     body.retain(|k, _| !STRIPPED_FIELDS.contains(&k.as_str()) && !k.starts_with("litellm_"));
 }
 
+/// Refuses request features that would let a client point the upstream,
+/// acting with the gateway's credentials, at resources the client picks:
+/// remote MCP servers (Anthropic `mcp_servers`, `mcp`/`mcp_toolset` tools
+/// in Anthropic and the Responses API), and objects stored in the upstream
+/// account (`file_id` anywhere in the body, Anthropic `container`).
+pub fn reject_upstream_resources(body: &Map<String, Value>) -> Result<(), TranslateError> {
+    if body.contains_key("mcp_servers") {
+        return Err(TranslateError::new(
+            "`mcp_servers` is not accepted: clients cannot attach MCP servers through ferrolite",
+        ));
+    }
+    if body.contains_key("container") {
+        return Err(TranslateError::new(
+            "`container` is not accepted: containers belong to the gateway's upstream account",
+        ));
+    }
+    let tools = body.get("tools").and_then(Value::as_array);
+    for (i, tool) in tools.into_iter().flatten().enumerate() {
+        if tool
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.starts_with("mcp"))
+        {
+            return Err(TranslateError::new(format!(
+                "tools[{i}]: MCP tools are not accepted: clients cannot attach MCP servers through ferrolite"
+            )));
+        }
+    }
+    if body.values().any(|v| contains_key(v, "file_id")) {
+        return Err(TranslateError::new(
+            "file references (`file_id`) are not accepted: stored files belong to the gateway's upstream account",
+        ));
+    }
+    Ok(())
+}
+
+fn contains_key(value: &Value, key: &str) -> bool {
+    match value {
+        Value::Object(map) => map.contains_key(key) || map.values().any(|v| contains_key(v, key)),
+        Value::Array(items) => items.iter().any(|v| contains_key(v, key)),
+        _ => false,
+    }
+}
+
 /// Fills in deployment defaults the client did not send.
 pub fn apply_defaults(body: &mut Map<String, Value>, defaults: &Map<String, Value>) {
     for (k, v) in defaults {
@@ -57,27 +101,22 @@ impl TranslateError {
     }
 }
 
-/// Removes parameters the target cannot accept, or fails naming them,
-/// as LiteLLM does when `drop_params` is false.
-pub(crate) fn check_params(
-    body: &mut Map<String, Value>,
+/// Parameters the target cannot accept: with `drop_params` they are
+/// returned for the caller to skip, otherwise this fails naming them, as
+/// LiteLLM does. The body is only read, so translating never copies it.
+pub(crate) fn check_params<'b>(
+    body: &'b Map<String, Value>,
     is_supported: impl Fn(&str, &Value) -> bool,
     drop_params: bool,
     target: &str,
-) -> Result<(), TranslateError> {
-    let unsupported: Vec<String> = body
+) -> Result<Vec<&'b str>, TranslateError> {
+    let unsupported: Vec<&str> = body
         .iter()
         .filter(|(k, v)| !is_supported(k, v))
-        .map(|(k, _)| k.clone())
+        .map(|(k, _)| k.as_str())
         .collect();
-    if unsupported.is_empty() {
-        return Ok(());
-    }
-    if drop_params {
-        for k in &unsupported {
-            body.remove(k);
-        }
-        return Ok(());
+    if unsupported.is_empty() || drop_params {
+        return Ok(unsupported);
     }
     Err(TranslateError::new(format!(
         "{target} does not support parameters: {}. Remove them, or set drop_params: true to drop them",
@@ -122,6 +161,14 @@ impl Usage {
             prompt: input.saturating_add(cached),
             completion: output.unwrap_or(0),
         })
+    }
+}
+
+/// `s` cut to at most `max` characters, with an ellipsis if it was cut.
+pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_owned(),
     }
 }
 
@@ -178,6 +225,41 @@ mod tests {
     }
 
     #[test]
+    fn rejects_client_steered_upstream_resources() {
+        for (body, needle) in [
+            (
+                json!({"mcp_servers": [{"type": "url", "url": "https://attacker.example/mcp"}]}),
+                "mcp_servers",
+            ),
+            (json!({"container": "cntr_123"}), "container"),
+            (
+                json!({"tools": [{"type": "mcp", "server_url": "https://attacker.example"}]}),
+                "tools[0]: MCP",
+            ),
+            (
+                json!({"tools": [{"name": "f"}, {"type": "mcp_toolset", "mcp_server_name": "x"}]}),
+                "tools[1]: MCP",
+            ),
+            (
+                json!({"messages": [{"role": "user", "content": [{"type": "document", "source": {"type": "file", "file_id": "file_1"}}]}]}),
+                "file_id",
+            ),
+            (
+                json!({"input": [{"content": [{"type": "input_file", "file_id": "file_2"}]}]}),
+                "file_id",
+            ),
+        ] {
+            let e = reject_upstream_resources(&map(body)).unwrap_err();
+            assert!(e.0.contains(needle), "{needle}: {e}");
+        }
+        let fine = map(json!({
+            "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}]}],
+            "tools": [{"type": "function", "function": {"name": "f"}}],
+        }));
+        assert!(reject_upstream_resources(&fine).is_ok());
+    }
+
+    #[test]
     fn defaults_never_override_the_client() {
         let mut body = map(json!({"temperature": 0.9}));
         let defaults = map(json!({"temperature": 0.1, "max_tokens": 10, "seed": 1}));
@@ -198,15 +280,15 @@ mod tests {
     #[test]
     fn check_params_drops_or_fails() {
         let supported = |k: &str, _: &Value| k == "model";
-        let mut body = map(json!({"model": "m", "seed": 1, "logprobs": true}));
-        let err = check_params(&mut body.clone(), supported, false, "anthropic").unwrap_err();
+        let body = map(json!({"model": "m", "seed": 1, "logprobs": true}));
+        let err = check_params(&body, supported, false, "anthropic").unwrap_err();
         assert!(
             err.0
                 .contains("anthropic does not support parameters: logprobs, seed"),
             "{err}"
         );
-        check_params(&mut body, supported, true, "anthropic").unwrap();
-        assert_eq!(Value::Object(body), json!({"model": "m"}));
+        let dropped = check_params(&body, supported, true, "anthropic").unwrap();
+        assert_eq!(dropped, ["logprobs", "seed"]);
     }
 
     #[test]

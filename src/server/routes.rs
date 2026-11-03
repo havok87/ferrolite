@@ -61,7 +61,15 @@ struct Log {
     attempts: u32,
     fallback: Option<String>,
     usage: Option<Usage>,
+    emitted: bool,
+    /// Set for proxied requests, so one dropped before it finished (the
+    /// client went away) is still logged and counted.
+    on_cancel: Option<Arc<AppState>>,
 }
+
+/// nginx's "client closed request": logged when the client disconnects
+/// before a response is ready.
+const CLIENT_CLOSED: u16 = 499;
 
 impl Log {
     fn new(st: &AppState, route: Route) -> Self {
@@ -74,10 +82,17 @@ impl Log {
             attempts: 0,
             fallback: None,
             usage: None,
+            emitted: false,
+            on_cancel: None,
         }
     }
 
-    fn emit(&self, st: &AppState, status: u16) {
+    fn log_if_cancelled(&mut self, st: &Arc<AppState>) {
+        self.on_cancel = Some(Arc::clone(st));
+    }
+
+    fn emit(&mut self, st: &AppState, status: u16) {
+        self.emitted = true;
         let elapsed = self.started.elapsed();
         st.metrics.request(self.route, status, elapsed);
         let latency_ms = elapsed.as_millis() as u64;
@@ -108,7 +123,7 @@ impl Log {
     }
 
     /// Logs, counts and stamps the request id on a finished response.
-    fn finish(self, st: &AppState, mut resp: Response<Body>) -> Response<Body> {
+    fn finish(mut self, st: &AppState, mut resp: Response<Body>) -> Response<Body> {
         if let Ok(v) = HeaderValue::from_str(&self.id) {
             resp.headers_mut().insert("x-request-id", v);
         }
@@ -123,16 +138,18 @@ impl Log {
     }
 }
 
+impl Drop for Log {
+    fn drop(&mut self) {
+        if !self.emitted
+            && let Some(st) = self.on_cancel.take()
+        {
+            self.emit(&st, CLIENT_CLOSED);
+        }
+    }
+}
+
 fn json_response(status: u16, value: &Value) -> Response<Body> {
-    let mut resp = Response::new(Body::from(value.to_string()));
-    *resp.status_mut() = axum::http::StatusCode::from_u16(status).unwrap_or_default();
-    let h = resp.headers_mut();
-    h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    resp
+    super::json_response(status, value.to_string())
 }
 
 /// `Err` with the 401 response if the request lacks the master key.
@@ -203,6 +220,7 @@ async fn proxy(
         Ok(log) => log,
         Err(resp) => return *resp,
     };
+    log.log_if_cancelled(&st);
     let Some(permit) = st.concurrency.try_acquire() else {
         let e = ApiError::new(
             503,
@@ -288,8 +306,7 @@ async fn proxy(
             if let Some(group) = &requested_group {
                 st.metrics.upstream_error(group, class);
             }
-            let cooldown = st.config.router.cooldown_time.as_secs().max(1);
-            return log.error(&st, ApiError::from_router(&err, cooldown), format);
+            return log.error(&st, ApiError::from_router(&err), format);
         }
     };
 
@@ -310,14 +327,7 @@ async fn proxy(
             }
             log.usage = usage;
             drop(permit);
-            let mut resp = Response::new(Body::from(body));
-            let h = resp.headers_mut();
-            h.insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            );
-            h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            log.finish(&st, resp)
+            log.finish(&st, super::json_response(200, body))
         }
         ProxyResponse::Stream { body, usage } => {
             let mut resp = Response::new(Body::empty());
@@ -359,13 +369,23 @@ struct StreamGuard {
 }
 
 impl Drop for StreamGuard {
+    /// The response stream is dropped before this guard (it is the first
+    /// field of the `Map` combinator), so the stream's outcome is final here.
     fn drop(&mut self) {
         if let Some(mut log) = self.log.take() {
             log.usage = self.usage.get();
             if let Some(u) = log.usage {
                 self.st.metrics.tokens(&self.group, u);
             }
-            log.emit(&self.st, 200);
+            // The 200 headers are long gone, but a stream that carried an
+            // upstream error or broke off is logged and counted as a failure.
+            let status = if self.usage.failed() {
+                self.st.metrics.upstream_error(&self.group, "stream_failed");
+                502
+            } else {
+                200
+            };
+            log.emit(&self.st, status);
         }
     }
 }

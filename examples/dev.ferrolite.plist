@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ferrolite as a launchd user agent (runs in your login session, so
+  keychain/ secret references work).
+
+  Replace every YOU below with your macOS user name (launchd does not
+  expand ~ or $HOME), then follow "Running under launchd" in README.md
+  to check the config, install, restart and remove the agent.
+
+  Keep secrets out of this file: use keychain/ or file/ references in
+  config.yaml rather than EnvironmentVariables here.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.ferrolite</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOU/.cargo/bin/ferrolite</string>
+        <string>--config</string>
+        <string>/Users/YOU/.config/ferrolite/config.yaml</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it exits with an error; a clean stop (exit 0) stays stopped. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Wait at least this many seconds between restarts, so a bad config
+         does not spin. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- 077: the log file (and anything else created) is readable by you only. -->
+    <key>Umask</key>
+    <integer>63</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/Library/Logs/ferrolite.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/Library/Logs/ferrolite.log</string>
+</dict>
+</plist>

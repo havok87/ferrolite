@@ -1,0 +1,84 @@
+# fmt, clippy, tests, cargo-deny and cargo-audit on macOS and Linux.
+#
+# Hardening: read-only token, no pull_request_target, first-party actions
+# only, each pinned to a full commit SHA (Dependabot keeps them current),
+# and checkout does not keep the token in the repository's git config.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_DENY_VERSION: 0.20.2
+  CARGO_AUDIT_VERSION: 0.22.2
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        # Reads rust-toolchain.toml.
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Cache cargo-deny and cargo-audit
+        id: tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-audit
+          key: tools-${{ runner.os }}-deny-${{ env.CARGO_DENY_VERSION }}-audit-${{ env.CARGO_AUDIT_VERSION }}
+
+      - name: Install cargo-deny and cargo-audit
+        if: steps.tools.outputs.cache-hit != 'true'
+        run: cargo install --locked "cargo-deny@${CARGO_DENY_VERSION}" "cargo-audit@${CARGO_AUDIT_VERSION}"
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: cargo deny
+        run: cargo deny check
+
+      - name: cargo audit
+        run: cargo audit
